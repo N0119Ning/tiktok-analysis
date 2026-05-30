@@ -14,6 +14,7 @@ from utils.metrics import get_metrics, export_metrics
 from agent_plan import agent_plan, explain_plan
 from agent_review import review_all_categories, review_single_subproblem, retry_subproblem_analysis
 from agent_chat import react_chat, load_results
+from agent_pipeline import run_pipeline_agent
 
 _applog = get_logger('app')
 _plog = get_logger('pipeline')
@@ -61,6 +62,147 @@ def _prepare_input_for_pipeline(filepath, info):
 
     target = os.path.join(BASE_DIR, 'data', 'TikTok.csv')
     df.to_csv(target, index=False)
+
+
+def _run_fixed_pipeline(info, status):
+    """原始固定流水线：三步直线执行。"""
+    pipeline_t0 = time.time()
+    metrics = get_metrics()
+    metrics.record_pipeline_run()
+
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.path.join(BASE_DIR, 'scripts')
+    env['HF_HUB_OFFLINE'] = '1'
+
+    status.write("**步骤 1/3: 数据清洗 + 向量化...**")
+    step1_t0 = time.time()
+    r1 = subprocess.run(
+        [VENV_PYTHON, os.path.join(BASE_DIR, 'scripts', 'step1_embedding.py')],
+        cwd=BASE_DIR, capture_output=True, text=True, env=env, timeout=900
+    )
+    step1_elapsed = (time.time() - step1_t0) * 1000
+    if r1.returncode != 0:
+        _plog.error(f'step1 FAILED elapsed={step1_elapsed:.0f}ms stderr={r1.stderr[-200:]}')
+        metrics.record_error()
+        status.error(f"步骤1 执行失败: {r1.stderr[-500:]}")
+        return
+    _plog.info(f'step1_embedding elapsed={step1_elapsed:.0f}ms')
+
+    original_file = os.path.join(BASE_DIR, 'data', 'TikTok.csv')
+    cleaned_file = os.path.join(BASE_DIR, 'outputs', 'cleaned_data.csv')
+    if os.path.exists(cleaned_file) and os.path.exists(original_file):
+        df_orig = pd.read_csv(original_file)
+        df_clean = pd.read_csv(cleaned_file)
+        orig_rows = len(df_orig)
+        clean_rows = len(df_clean)
+        filter_rate = (orig_rows - clean_rows) / orig_rows * 100 if orig_rows > 0 else 0
+        avg_words = df_clean['word_count'].mean() if 'word_count' in df_clean.columns else 0
+        status.write(f"[检查点 1/2] 清洗完成 — {orig_rows}条→{clean_rows}条 (过滤{filter_rate:.1f}%) | 平均{avg_words:.1f}词/条")
+
+        filter_stats_path = os.path.join(BASE_DIR, 'outputs', 'filter_stats.json')
+        if os.path.exists(filter_stats_path):
+            with open(filter_stats_path, 'r', encoding='utf-8') as f:
+                fs = json.load(f)
+            status.write(
+                f"过滤明细: 词数不足({fs.get('min_words',3)}词) {fs.get('filtered_by_length',0)}条 | "
+                f"纯情绪评论 {fs.get('filtered_by_emotion',0)}条"
+            )
+
+        _plog.info(f'checkpoint1 rows_in={orig_rows} rows_out={clean_rows} filter_pct={filter_rate:.1f} avg_words={avg_words:.1f}')
+        metrics.record_step('step1', step1_elapsed, items_in=orig_rows, items_out=clean_rows)
+    else:
+        status.write("[检查点 1/2] 清洗完成")
+        _plog.info('checkpoint1 no_data')
+
+    status.write("**步骤 2/3: 问题分类 + AI 深度分析...**")
+    step3_t0 = time.time()
+    r3 = subprocess.run(
+        [VENV_PYTHON, os.path.join(BASE_DIR, 'scripts', 'step3_summary.py')],
+        cwd=BASE_DIR, capture_output=True, text=True, env=env, timeout=600
+    )
+    step3_elapsed = (time.time() - step3_t0) * 1000
+    if r3.returncode != 0:
+        _plog.error(f'step3 FAILED elapsed={step3_elapsed:.0f}ms stderr={r3.stderr[-200:]}')
+        metrics.record_error()
+        status.error(f"步骤3 执行失败: {r3.stderr[-500:]}")
+        return
+    _plog.info(f'step3_summary elapsed={step3_elapsed:.0f}ms')
+    metrics.record_step('step3', step3_elapsed)
+
+    result_path = os.path.join(BASE_DIR, 'outputs', 'result.json')
+    review_log, reviewed_path = review_all_categories(result_path)
+    low_count = review_log['low_confidence']
+
+    status.write(f"[检查点 2/2] 质量自检 — 子问题:{review_log['total_checks']} | 高:{review_log['high_confidence']} 中:{review_log['medium_confidence']} 低:{review_log['low_confidence']}")
+    _plog.info(
+        f'checkpoint2_review total={review_log["total_checks"]} '
+        f'high={review_log["high_confidence"]} mid={review_log["medium_confidence"]} low={review_log["low_confidence"]}'
+    )
+
+    if low_count > 2 and review_log['total_checks'] > 0:
+        status.write(f"  [!]发现 {low_count} 个低置信度子问题，自动重试中（最多2轮）...")
+        _plog.info(f'retry_start initial_low={low_count}')
+
+        with open(reviewed_path, 'r', encoding='utf-8') as f:
+            reviewed_data = json.load(f)
+
+        retry_round = 0
+        max_retry_rounds = 2
+        while retry_round < max_retry_rounds:
+            retry_round += 1
+            retried = 0
+            categories = reviewed_data.get('categories', {})
+            for cat_id, cat_data in categories.items():
+                cat_label = cat_data.get('category_label', cat_id)
+                for sp in cat_data.get('subproblems', []):
+                    conf = sp.get('review', {}).get('confidence', 'low')
+                    if conf == 'low':
+                        sp = retry_subproblem_analysis(sp, cat_label)
+                        retried += 1
+                        new_review = review_single_subproblem(sp, cat_label)
+                        sp['review'] = new_review
+
+            new_low = sum(
+                1 for c in categories.values()
+                for sp in c.get('subproblems', [])
+                if sp.get('review', {}).get('confidence', 'low') == 'low'
+            )
+            status.write(f"  [R]重试第{retry_round}轮 — 修复{retried}个 | 低置信度: {low_count}→{new_low}")
+            _plog.info(f'retry_round round={retry_round} fixed={retried} low_before={low_count} low_after={new_low}')
+            metrics.record_retry_round(retried)
+            if new_low == 0 or retried == 0:
+                break
+            low_count = new_low
+
+        with open(reviewed_path, 'w', encoding='utf-8') as f:
+            json.dump(reviewed_data, f, indent=2, ensure_ascii=False)
+        status.write(f"  [OK]重试完成 — 最终低置信度: {new_low}")
+    else:
+        status.write(f"  [OK]质量通过")
+
+    pipeline_elapsed = (time.time() - pipeline_t0) * 1000
+    _plog.info(f'pipeline_complete total_elapsed={pipeline_elapsed:.0f}ms')
+    metrics.record_pipeline_complete()
+    export_metrics()
+    status.update(label="全部分析完成!", state="complete")
+
+
+def _run_agent_pipeline(filepath, status):
+    """Agent 自主分析模式：LLM 在 ReAct 循环中自主决定工具调用。"""
+    from agent_pipeline import run_pipeline_agent, get_state
+    status.write("[Agent] 启动自主分析引擎...")
+    success, summary, result_path = run_pipeline_agent(filepath)
+
+    if success:
+        st_state = get_state()
+        checked = st_state.review_checks if st_state else 0
+        analyzed = st_state.subproblems_analyzed if st_state else 0
+        status.write(f"[Agent] {summary} | 分析了{analyzed}个子问题, 自检{checked}次")
+        status.update(label="Agent 分析完成!", state="complete")
+    else:
+        status.error(f"Agent 分析失败: {summary}")
+        status.update(label="分析中断", state="error")
+
 
 st.set_page_config(page_title="AI 评论分析 Agent", layout="wide")
 
@@ -480,139 +622,27 @@ if st.session_state.page == 'upload':
         st.subheader("Agent 分析计划")
         st.markdown(explain_plan(st.session_state.pipeline_plan))
 
-        if st.button("确认计划，开始分析", key="btn_confirm"):
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            run_fixed = st.button("一键分析（固定流程）", key="btn_confirm", use_container_width=True)
+        with btn_col2:
+            run_agent = st.button("Agent 自主分析（灵活路径）", key="btn_agent", use_container_width=True)
+
+        if run_fixed or run_agent:
             plan = st.session_state.pipeline_plan
             info = st.session_state.pipeline_info
             filepath = info['filepath']
 
-            with st.status("正在执行分析流水线...", expanded=True) as status:
-                pipeline_t0 = time.time()
-                metrics = get_metrics()
-                metrics.record_pipeline_run()
-
-                st.write("**步骤 1/3: 数据清洗 + 向量化...**")
-                step1_t0 = time.time()
-                env = os.environ.copy()
-                env['PYTHONPATH'] = os.path.join(BASE_DIR, 'scripts')
-                env['HF_HUB_OFFLINE'] = '1'
-                r1 = subprocess.run(
-                    [VENV_PYTHON, os.path.join(BASE_DIR, 'scripts', 'step1_embedding.py')],
-                    cwd=BASE_DIR, capture_output=True, text=True, env=env, timeout=900
-                )
-                step1_elapsed = (time.time() - step1_t0) * 1000
-                if r1.returncode != 0:
-                    _plog.error(f'step1 FAILED elapsed={step1_elapsed:.0f}ms stderr={r1.stderr[-200:]}')
-                    metrics.record_error()
-                    st.error(f"步骤1 执行失败: {r1.stderr[-500:]}")
-                    st.stop()
-                _plog.info(f'step1_embedding elapsed={step1_elapsed:.0f}ms')
-
-                # ---- Checkpoint 1: 数据清洗质量 ----
-                original_file = os.path.join(BASE_DIR, 'data', 'TikTok.csv')
-                cleaned_file = os.path.join(BASE_DIR, 'outputs', 'cleaned_data.csv')
-                if os.path.exists(cleaned_file) and os.path.exists(original_file):
-                    df_orig = pd.read_csv(original_file)
-                    df_clean = pd.read_csv(cleaned_file)
-                    orig_rows = len(df_orig)
-                    clean_rows = len(df_clean)
-                    filter_rate = (orig_rows - clean_rows) / orig_rows * 100 if orig_rows > 0 else 0
-                    avg_words = df_clean['word_count'].mean() if 'word_count' in df_clean.columns else 0
-                    st.write(f"[检查点 1/2] 清洗完成 — {orig_rows}条→{clean_rows}条 (过滤{filter_rate:.1f}%) | 平均{avg_words:.1f}词/条")
-
-                    filter_stats_path = os.path.join(BASE_DIR, 'outputs', 'filter_stats.json')
-                    if os.path.exists(filter_stats_path):
-                        with open(filter_stats_path, 'r', encoding='utf-8') as f:
-                            fs = json.load(f)
-                        st.caption(
-                            f"过滤明细: 词数不足({fs.get('min_words',3)}词) {fs.get('filtered_by_length',0)}条 | "
-                            f"纯情绪评论 {fs.get('filtered_by_emotion',0)}条"
-                        )
-
-                    _plog.info(f'checkpoint1 rows_in={orig_rows} rows_out={clean_rows} filter_pct={filter_rate:.1f} avg_words={avg_words:.1f}')
-                    metrics.record_step('step1', step1_elapsed, items_in=orig_rows, items_out=clean_rows)
-                else:
-                    st.write("[检查点 1/2] 清洗完成")
-                    _plog.info('checkpoint1 no_data')
-
-                st.write("**步骤 2/3: 问题分类 + AI 深度分析...**")
-                step3_t0 = time.time()
-                r3 = subprocess.run(
-                    [VENV_PYTHON, os.path.join(BASE_DIR, 'scripts', 'step3_summary.py')],
-                    cwd=BASE_DIR, capture_output=True, text=True, env=env, timeout=600
-                )
-                step3_elapsed = (time.time() - step3_t0) * 1000
-                if r3.returncode != 0:
-                    _plog.error(f'step3 FAILED elapsed={step3_elapsed:.0f}ms stderr={r3.stderr[-200:]}')
-                    metrics.record_error()
-                    st.error(f"步骤3 执行失败: {r3.stderr[-500:]}")
-                    st.stop()
-                _plog.info(f'step3_summary elapsed={step3_elapsed:.0f}ms')
-                metrics.record_step('step3', step3_elapsed)
-
-                # ---- Review + Checkpoint 2: 分析质量自检 + 重试 ----
-                result_path = os.path.join(BASE_DIR, 'outputs', 'result.json')
-                review_log, reviewed_path = review_all_categories(result_path)
-                low_count = review_log['low_confidence']
-
-                st.write(f"[检查点 2/2] 质量自检 — 子问题:{review_log['total_checks']} | 高:{review_log['high_confidence']} 中:{review_log['medium_confidence']} 低:{review_log['low_confidence']}")
-                _plog.info(
-                    f'checkpoint2_review total={review_log["total_checks"]} '
-                    f'high={review_log["high_confidence"]} mid={review_log["medium_confidence"]} low={review_log["low_confidence"]}'
-                )
-
-                # 低置信度子问题过多 → 重试
-                if low_count > 2 and review_log['total_checks'] > 0:
-                    st.write(f"  [!]发现 {low_count} 个低置信度子问题，自动重试中（最多2轮）...")
-                    _plog.info(f'retry_start initial_low={low_count}')
-
-                    with open(reviewed_path, 'r', encoding='utf-8') as f:
-                        reviewed_data = json.load(f)
-
-                    retry_round = 0
-                    max_retry_rounds = 2
-                    while retry_round < max_retry_rounds:
-                        retry_round += 1
-                        retried = 0
-                        categories = reviewed_data.get('categories', {})
-                        for cat_id, cat_data in categories.items():
-                            cat_label = cat_data.get('category_label', cat_id)
-                            for sp in cat_data.get('subproblems', []):
-                                conf = sp.get('review', {}).get('confidence', 'low')
-                                if conf == 'low':
-                                    sp = retry_subproblem_analysis(sp, cat_label)
-                                    retried += 1
-                                    # 重新 review 该子问题
-                                    new_review = review_single_subproblem(sp, cat_label)
-                                    sp['review'] = new_review
-
-                        # 统计本轮结果
-                        new_low = sum(
-                            1 for c in categories.values()
-                            for sp in c.get('subproblems', [])
-                            if sp.get('review', {}).get('confidence', 'low') == 'low'
-                        )
-                        st.write(f"  [R]重试第{retry_round}轮 — 修复{retried}个 | 低置信度: {low_count}→{new_low}")
-                        _plog.info(f'retry_round round={retry_round} fixed={retried} low_before={low_count} low_after={new_low}')
-                        metrics.record_retry_round(retried)
-                        if new_low == 0 or retried == 0:
-                            break
-                        low_count = new_low
-
-                    # 保存更新后的结果
-                    with open(reviewed_path, 'w', encoding='utf-8') as f:
-                        json.dump(reviewed_data, f, indent=2, ensure_ascii=False)
-                    st.write(f"  [OK]重试完成 — 最终低置信度: {new_low}")
-                else:
-                    st.write(f"  [OK]质量通过")
-
-                pipeline_elapsed = (time.time() - pipeline_t0) * 1000
-                _plog.info(f'pipeline_complete total_elapsed={pipeline_elapsed:.0f}ms')
-                metrics.record_pipeline_complete()
-                export_metrics()
-
-                status.update(label="全部分析完成!", state="complete")
+            mode_label = "固定流水线" if run_fixed else "Agent 自主分析"
+            with st.status(f"正在执行分析... [{mode_label}]", expanded=True) as status:
+                if run_fixed:
+                    _run_fixed_pipeline(info, status)
+                elif run_agent:
+                    _run_agent_pipeline(filepath, status)
 
             st.session_state.pipeline_ran = True
+            st.session_state.reviewed = True
+            st.rerun()
             st.session_state.reviewed = True
             st.rerun()
 

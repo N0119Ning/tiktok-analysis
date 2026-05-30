@@ -2,7 +2,6 @@ import pandas as pd
 import re
 import os
 import time
-from openai import OpenAI
 
 from utils.logger import get_logger
 from utils.metrics import get_metrics

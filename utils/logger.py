@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+import threading
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone, timedelta
 
@@ -49,34 +50,39 @@ def _make_handler(filename, max_bytes=10 * 1024 * 1024, backup_count=5):
     return handler
 
 
+_setup_lock = threading.Lock()
+
 def setup_logging():
     """初始化全部 logger（幂等）."""
     if _loggers:
         return
+    with _setup_lock:
+        if _loggers:
+            return
 
-    # pipeline 日志
-    pl = logging.getLogger('pipeline')
-    pl.setLevel(logging.DEBUG)
-    pl.addHandler(_make_handler('pipeline.log'))
-    pl.propagate = False
+        # pipeline 日志
+        pl = logging.getLogger('pipeline')
+        pl.setLevel(logging.DEBUG)
+        pl.addHandler(_make_handler('pipeline.log'))
+        pl.propagate = False
 
-    # LLM 调用日志
-    llm = logging.getLogger('llm')
-    llm.setLevel(logging.DEBUG)
-    llm.addHandler(_make_handler('llm_calls.log'))
-    llm.propagate = False
+        # LLM 调用日志
+        llm = logging.getLogger('llm')
+        llm.setLevel(logging.DEBUG)
+        llm.addHandler(_make_handler('llm_calls.log'))
+        llm.propagate = False
 
-    # 应用日志
-    app = logging.getLogger('app')
-    app.setLevel(logging.DEBUG)
-    h = _make_handler('app.log')
-    h.setLevel(logging.DEBUG)
-    app.addHandler(h)
-    app.propagate = False
+        # 应用日志
+        app = logging.getLogger('app')
+        app.setLevel(logging.DEBUG)
+        h = _make_handler('app.log')
+        h.setLevel(logging.DEBUG)
+        app.addHandler(h)
+        app.propagate = False
 
-    _loggers['pipeline'] = pl
-    _loggers['llm'] = llm
-    _loggers['app'] = app
+        _loggers['pipeline'] = pl
+        _loggers['llm'] = llm
+        _loggers['app'] = app
 
 
 def get_logger(name='app'):

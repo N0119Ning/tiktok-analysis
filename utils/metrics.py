@@ -160,7 +160,9 @@ class MetricsCollector:
 def get_metrics():
     global _metrics
     if _metrics is None:
-        _metrics = MetricsCollector()
+        with _lock:
+            if _metrics is None:
+                _metrics = MetricsCollector()
     return _metrics
 
 

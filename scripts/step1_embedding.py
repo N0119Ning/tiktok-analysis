@@ -95,8 +95,10 @@ def spell_correct(text):
     words = text.split()
     corrected = []
     for word in words:
-        if word in COMMON_MISSPELLINGS:
-            corrected.append(COMMON_MISSPELLINGS[word])
+        # Strip punctuation to match dictionary keys (handles "helpp!" -> "helpp")
+        stripped = re.sub(r'^[^\w]+|[^\w]+$', '', word)
+        if stripped in COMMON_MISSPELLINGS:
+            corrected.append(COMMON_MISSPELLINGS[stripped])
         else:
             corrected.append(word)
     return ' '.join(corrected)

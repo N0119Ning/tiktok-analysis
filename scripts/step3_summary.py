@@ -558,10 +558,10 @@ def select_representative_comments(comments, keywords, top_n=3):
         
         # 4. 长度权重（太短的信息量不足）
         word_count = len(comment.split())
-        if word_count >= 5:
-            score += 3
-        elif word_count >= 10:
+        if word_count >= 10:
             score += 5
+        elif word_count >= 5:
+            score += 3
         
         # 5. 包含具体行为/场景的描述更典型
         action_words = ['when', 'after', 'before', 'while', 'trying', 'attempt', 'open', 'use', 'click', 'tap', 'try']

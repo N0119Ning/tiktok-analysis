@@ -153,6 +153,18 @@ def _tool_search_comments(results, keyword, category_id=None):
     keyword_lower = keyword.lower()
     mask = df[text_col].astype(str).str.lower().str.contains(keyword_lower, na=False)
 
+    # Category filtering: match against representative comments in the specified category
+    if category_id and results:
+        categories = results.get('categories', {})
+        cat_data = categories.get(category_id)
+        if cat_data:
+            cat_comments = set()
+            for sp in cat_data.get('subproblems', []):
+                for c in sp.get('representative_comments', []):
+                    cat_comments.add(c[:80])
+            if cat_comments:
+                mask = mask & df[text_col].astype(str).str[:80].isin(cat_comments)
+
     if mask.sum() == 0:
         return {'results': [], 'keyword': keyword, 'total_found': 0}
 

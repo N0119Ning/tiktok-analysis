@@ -96,7 +96,7 @@ def retry_subproblem_analysis(sp_data, category_label):
     t0 = time.time()
 
     comments_text = '\n'.join(sp_data.get('representative_comments', [])[:10])
-    keywords = sp_data.get('keywords', [])
+    keywords = ', '.join(sp_data.get('keywords', []))
 
     prompt = f"""你正在分析类别为"{category_label}"的用户反馈。
 子问题名: {sp_data.get('name', 'unknown')}
@@ -183,7 +183,7 @@ def review_all_categories(result_json_path):
                 'review': sp_review
             })
             review_log['total_checks'] += 1
-            conf = sp_review.get('confidence', 'low')
+            conf = sp_review.get('confidence') or 'low'
             review_log[f'{conf}_confidence'] += 1
             metrics.record_review_check(conf)
 

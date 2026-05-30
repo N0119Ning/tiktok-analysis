@@ -1,4 +1,7 @@
 id: enhance-agent-decision
 status: proposed
-title: Agent 决策能力增强 — LLM 自主规划 + 自适应 Pipeline
+title: Pipeline Tool化 — Agent自主调用工具完成分析
 created: 2026-05-30
+updated: 2026-05-30
+scope: P0 only — 拆 pipeline 为独立 tools，Agent ReAct 自主决策
+model: deepseek-flash-v4

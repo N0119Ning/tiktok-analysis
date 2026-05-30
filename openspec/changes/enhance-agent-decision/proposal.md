@@ -1,43 +1,74 @@
 ## Why
 
-当前项目的 Agent 能力名不副实：
-
-1. **Agent Plan 是假 Agent** — `agent_plan.py` 的 `build_plan()` 只有几行 if-else，n_clusters 根据行数机械匹配（<100 条=3 类，>2000 条=8 类），完全没有"智能"。LLM 从未参与规划决策。
-2. **Pipeline 是固定流水线** — 三步直线执行（清洗→分类→分析），没有分支、没有自适应、没有"观察结果后决定下一步"的 Agent 循环。
-3. **Review 只有一次 retry** — 固定最多 2 轮，每轮对所有低置信度子问题无差别重试，不会根据重试效果调整策略。
-
-用户看到的是一个自动化脚本，不是 Agent。
+当前项目的 Agent 能力名不副实——pipeline 是固定三步直线执行，完全没有"观察数据→决定策略→调用工具→观察结果→决定下一步"的 Agent 循环。
 
 ## What Changes
 
-### 改动 1: LLM Agent Plan — 真正的智能规划
+### P0: Pipeline Tool 化 — Agent 自主调工具
 
-- **`agent_plan.py`** 重写：`build_plan()` 不再用 if-else 规则，改为调用 DeepSeek LLM
-- LLM 输入：CSV 数据摘要 + 50 条随机评论样本
-- LLM 自主决策输出：n_clusters、清洗策略、分析角度（产品/运营/技术/安全）、关注焦点（特定话题/评分区间/时间模式）
-- 人工可确认/修改：LLM 规划结果仍展示给用户确认
+把 `step1_embedding.py` + `step3_summary.py` + `agent_review.py` 的每一步拆成独立 tool（OpenAI function calling 格式），Agent 在 ReAct 循环中自主决定调用什么工具、什么顺序、什么参数。
 
-### 改动 2: 自适应 Pipeline — 分支决策 + 多轮自改进
+### 工具集 (15 个)
 
-- **`app.py`** pipeline 改为 Agent 循环：每步执行后，Agent 观察输出质量，决定下一步
-- 新增 `agent_pipeline.py`：Pipeline Agent，在关键节点做决策
-  - Step1 后：数据清洗质量是否达标？是否需要调整过滤策略？
-  - Step3 后：分类结果是否符合预期？是否需要拆分/合并类别？
-  - Review 后：当前低置信度子问题是否需要换分析角度重试？是否该停止？
-- Review 改为动态终止：不再固定 2 轮，改为"连续 N 轮无改善 → 停止"，或"低置信度占比 < 阈值 → 停止"
+**Pipeline 工具 (9 个) — 新增**
+
+| 工具 | 来源 | 功能 |
+|------|------|------|
+| `inspect_data` | `agent_plan.inspect_csv` | 读 CSV，返回列名/类型/样本/评分分布/语言 |
+| `clean_data` | `step1_embedding` | 清洗+拼写纠正，参数: min_words, language |
+| `generate_embeddings` | `step1_embedding` | 文本转向量（可选，Agent 判断是否需要） |
+| `classify_comments` | `step3_summary` | 9 类关键词分类，返回各类计数 |
+| `split_subproblems` | `step3_summary` | LLM 拆子问题，参数: category_id |
+| `analyze_subproblem` | `step3_summary` | LLM 生成 problem/scene/impact/solution |
+| `review_analysis` | `agent_review` | LLM 自检质量，返回 confidence |
+| `retry_analysis` | `agent_review` | 重分析低质量子问题 |
+| `get_pipeline_status` | **新建** | 返回当前进度: {step, counts, quality} |
+
+**Query 工具 (5 个) — 已有，保留**
+`get_overall_stats`, `get_category_list`, `get_category_detail`, `search_comments`, `compare_categories`
+
+**Agent 决策工具 (1 个) — 新增**
+
+| 工具 | 功能 |
+|------|------|
+| `finalize_report` | Agent 确认分析完成，汇总结果 |
+
+### Agent 循环
+
+```
+用户: "分析这份CSV"
+
+Agent: → inspect_data → "1万条英文评论，评分1-5分布均匀，98%有效文本"
+       → clean_data(min_words=2) → "过滤8%，保留9200条"
+       → classify_comments → "9类分布：性能320条，账号280条..."
+       → split_subproblems("performance") → "3个子问题"
+       → split_subproblems("account") → "2个子问题"
+       → analyze_subproblem("performance", "启动卡顿") → "完成"
+       → analyze_subproblem("performance", "视频加载慢") → "完成"
+       → ...
+       → review_analysis → "2个低质量，重试"
+       → retry_analysis("account", "登录失败") → "改进了"
+       → finalize_report → "分析完成"
+```
+
+### 回退兼容
+
+`app.py` 保留现有的固定 pipeline 按钮（"一键分析"），新增"Agent 自主分析"模式。用户可选两种模式。
 
 ## Capabilities
 
-### New Capabilities
-- `llm-plan`: LLM 抽样阅读评论后自主制定分析策略（聚类数、分析角度、关注焦点、异常检测）
-- `adaptive-pipeline`: Pipeline Agent 在关键检查点观察质量指标，自主决定是否调整策略、重新执行或进入下一阶段
+### New
+- `agent-pipeline`: Agent 在 ReAct 循环中自主调用 15 个工具完成从数据到报告的全流程
+- `pipeline-status`: 进度状态查询，Agent 据此决定下一步
 
-### Modified Capabilities
-- `agent-review`: 多轮自改进从固定 2 轮改为动态终止条件
+### Modified
+- `agent-plan`: 从 `build_plan()` 规则逻辑改为 `inspect_data` tool
+- `agent-review`: 不再作为独立阶段，而是 Agent 在分析后自主调用的工具
+- `react-chat`: 追问工具集保持不变
 
 ## Impact
 
-- 受影响的文件：`agent_plan.py`(重写), `app.py`(pipeline 改为 Agent 循环), 新增 `agent_pipeline.py`
-- 依赖：DeepSeek API（多一轮 LLM 调用用于 plan 生成）
-- 向后兼容：用户仍可查看和确认 Agent 生成的 plan
-- 废弃：`build_plan()` 中的硬编码规则逻辑
+- 新增: `agent_pipeline.py` (Agent 循环 + 15 个 tool 定义 + tool 实现)
+- 改动: `app.py` (增加 "Agent 自主分析" 模式入口)
+- 保留: `agent_chat.py` (追问 tab 不变)
+- 保留: `scripts/step1_embedding.py`, `scripts/step3_summary.py`, `agent_review.py` (被 tool 封装调用，不删除)
